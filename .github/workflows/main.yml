@@ -1,0 +1,419 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Compilar la app Android
+        run: |
+          set -e
+          mkdir -p cap/www ~/.android
+          if [ -f debug.keystore ]; then cp debug.keystore ~/.android/debug.keystore; fi
+          cp index.html manifest.webmanifest icon-192.png icon-512.png cap/www/
+          cd cap
+          cat > package.json <<'EOF'
+          {
+            "name": "reproductor-pro",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/core": "^6.2.0",
+              "@capacitor/android": "^6.2.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^6.2.0"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.polapasc.reproductorpro",
+            "appName": "Reproductor Pro",
+            "webDir": "www"
+          }
+          EOF
+          npm install
+          npx cap add android
+          PKG=android/app/src/main/java/com/polapasc/reproductorpro
+          cat > $PKG/MusicScanner.java <<'EOF'
+          package com.polapasc.reproductorpro;
+
+          import android.Manifest;
+          import android.database.Cursor;
+          import android.os.Build;
+          import android.provider.MediaStore;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+
+          @CapacitorPlugin(
+              name = "MusicScanner",
+              permissions = {
+                  @Permission(alias = "audio", strings = { Manifest.permission.READ_MEDIA_AUDIO }),
+                  @Permission(alias = "storage", strings = { Manifest.permission.READ_EXTERNAL_STORAGE })
+              }
+          )
+          public class MusicScanner extends Plugin {
+
+              private String alias() {
+                  return Build.VERSION.SDK_INT >= 33 ? "audio" : "storage";
+              }
+
+              @PluginMethod
+              public void scan(PluginCall call) {
+                  if (getPermissionState(alias()) != PermissionState.GRANTED) {
+                      requestPermissionForAlias(alias(), call, "afterPerm");
+                      return;
+                  }
+                  doScan(call);
+              }
+
+              @PermissionCallback
+              private void afterPerm(PluginCall call) {
+                  if (getPermissionState(alias()) == PermissionState.GRANTED) {
+                      doScan(call);
+                  } else {
+                      call.reject("permiso_denegado");
+                  }
+              }
+
+              private void doScan(final PluginCall call) {
+                  new Thread(() -> {
+                      try {
+                          JSArray arr = new JSArray();
+                          String[] proj = {
+                              MediaStore.Audio.Media._ID,
+                              MediaStore.Audio.Media.TITLE,
+                              MediaStore.Audio.Media.ARTIST,
+                              MediaStore.Audio.Media.ALBUM,
+                              MediaStore.Audio.Media.DURATION,
+                              MediaStore.Audio.Media.DATA
+                          };
+                          String sel = MediaStore.Audio.Media.IS_MUSIC + " != 0 AND " + MediaStore.Audio.Media.DURATION + " >= 30000";
+                          Cursor c = getContext().getContentResolver().query(
+                              MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, sel, null,
+                              MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC");
+                          if (c != null) {
+                              while (c.moveToNext()) {
+                                  JSObject o = new JSObject();
+                                  o.put("id", c.getLong(0));
+                                  o.put("title", c.getString(1));
+                                  o.put("artist", c.getString(2));
+                                  o.put("album", c.getString(3));
+                                  o.put("duration", c.getLong(4));
+                                  o.put("path", c.getString(5));
+                                  arr.put(o);
+                              }
+                              c.close();
+                          }
+                          JSObject res = new JSObject();
+                          res.put("tracks", arr);
+                          call.resolve(res);
+                      } catch (Exception e) {
+                          call.reject("scan_error: " + e.getMessage());
+                      }
+                  }).start();
+              }
+          }
+          EOF
+          cat > $PKG/MainActivity.java <<'EOF'
+          package com.polapasc.reproductorpro;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MusicScanner.class);
+                  registerPlugin(MediaControls.class);
+                  super.onCreate(savedInstanceState);
+              }
+
+              @Override
+              public void onPause() {
+                  super.onPause();
+                  try {
+                      getBridge().getWebView().onResume();
+                      getBridge().getWebView().resumeTimers();
+                  } catch (Exception e) {
+                  }
+              }
+          }
+          EOF
+          cat > $PKG/MediaControls.java <<'EOF'
+          package com.polapasc.reproductorpro;
+
+          import android.Manifest;
+          import android.content.Intent;
+          import android.os.Build;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+
+          @CapacitorPlugin(
+              name = "MediaControls",
+              permissions = {
+                  @Permission(alias = "notif", strings = { Manifest.permission.POST_NOTIFICATIONS })
+              }
+          )
+          public class MediaControls extends Plugin {
+              static MediaControls instance;
+              private boolean asked = false;
+
+              @Override
+              public void load() {
+                  instance = this;
+              }
+
+              static void emit(String name, long pos) {
+                  if (instance == null) return;
+                  JSObject o = new JSObject();
+                  o.put("name", name);
+                  o.put("position", pos);
+                  instance.notifyListeners("action", o);
+              }
+
+              @PluginMethod
+              public void update(PluginCall call) {
+                  if (Build.VERSION.SDK_INT >= 33 && !asked && getPermissionState("notif") != PermissionState.GRANTED) {
+                      asked = true;
+                      requestPermissionForAlias("notif", call, "afterNotif");
+                      return;
+                  }
+                  send(call);
+              }
+
+              @PermissionCallback
+              private void afterNotif(PluginCall call) {
+                  send(call);
+              }
+
+              private void send(PluginCall call) {
+                  Intent i = new Intent(getContext(), MediaService.class);
+                  i.setAction("UPDATE");
+                  String title = call.getString("title", "");
+                  String artist = call.getString("artist", "");
+                  boolean playing = call.getBoolean("playing", false);
+                  double position = call.getDouble("position", 0.0);
+                  double duration = call.getDouble("duration", 0.0);
+                  double speed = call.getDouble("speed", 1.0);
+                  i.putExtra("title", title);
+                  i.putExtra("artist", artist);
+                  i.putExtra("playing", playing);
+                  i.putExtra("pos", (long) position);
+                  i.putExtra("dur", (long) duration);
+                  i.putExtra("speed", (float) speed);
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          getContext().startForegroundService(i);
+                      } else {
+                          getContext().startService(i);
+                      }
+                  } catch (Exception e) {
+                      call.reject("servicio: " + e.getMessage());
+                      return;
+                  }
+                  call.resolve();
+              }
+          }
+          EOF
+          cat > $PKG/MediaService.java <<'EOF'
+          package com.polapasc.reproductorpro;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.MediaMetadata;
+          import android.media.session.MediaSession;
+          import android.media.session.PlaybackState;
+          import android.os.Build;
+          import android.os.IBinder;
+
+          public class MediaService extends Service {
+              static final String CH = "rp_media";
+              private MediaSession session;
+              private String title = "";
+              private String artist = "";
+              private boolean playing = false;
+              private long pos = 0;
+              private long dur = 0;
+              private float speed = 1f;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel c = new NotificationChannel(CH, "Reproduccion", NotificationManager.IMPORTANCE_LOW);
+                      c.setShowBadge(false);
+                      c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                      NotificationManager nm = getSystemService(NotificationManager.class);
+                      nm.createNotificationChannel(c);
+                  }
+                  session = new MediaSession(this, "ReproductorPro");
+                  session.setCallback(new MediaSession.Callback() {
+                      @Override
+                      public void onPlay() {
+                          MediaControls.emit("play", 0);
+                      }
+
+                      @Override
+                      public void onPause() {
+                          MediaControls.emit("pause", 0);
+                      }
+
+                      @Override
+                      public void onSkipToNext() {
+                          MediaControls.emit("next", 0);
+                      }
+
+                      @Override
+                      public void onSkipToPrevious() {
+                          MediaControls.emit("prev", 0);
+                      }
+
+                      @Override
+                      public void onSeekTo(long p) {
+                          MediaControls.emit("seek", p);
+                      }
+
+                      @Override
+                      public void onStop() {
+                          MediaControls.emit("stop", 0);
+                      }
+                  });
+                  session.setActive(true);
+              }
+
+              @Override
+              public int onStartCommand(Intent in, int flags, int startId) {
+                  String a = in == null ? null : in.getAction();
+                  if ("UPDATE".equals(a)) {
+                      title = in.getStringExtra("title");
+                      artist = in.getStringExtra("artist");
+                      playing = in.getBooleanExtra("playing", false);
+                      pos = in.getLongExtra("pos", 0);
+                      dur = in.getLongExtra("dur", 0);
+                      speed = in.getFloatExtra("speed", 1f);
+                      render();
+                  } else if ("STOP".equals(a)) {
+                      stopForeground(true);
+                      stopSelf();
+                  } else if (a != null) {
+                      MediaControls.emit(a, 0);
+                  } else {
+                      stopSelf();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private PendingIntent act(String name) {
+                  Intent i = new Intent(this, MediaService.class);
+                  i.setAction(name);
+                  int fl = PendingIntent.FLAG_UPDATE_CURRENT;
+                  if (Build.VERSION.SDK_INT >= 23) fl |= PendingIntent.FLAG_IMMUTABLE;
+                  return PendingIntent.getService(this, name.hashCode(), i, fl);
+              }
+
+              private void render() {
+                  long acts = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE
+                      | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                      | PlaybackState.ACTION_SEEK_TO | PlaybackState.ACTION_STOP;
+                  session.setPlaybackState(new PlaybackState.Builder()
+                      .setActions(acts)
+                      .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED, pos, playing ? speed : 0f)
+                      .build());
+                  session.setMetadata(new MediaMetadata.Builder()
+                      .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                      .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+                      .putLong(MediaMetadata.METADATA_KEY_DURATION, dur)
+                      .build());
+                  Notification.Builder nb;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nb = new Notification.Builder(this, CH);
+                  } else {
+                      nb = new Notification.Builder(this);
+                  }
+                  Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
+                  int fl = PendingIntent.FLAG_UPDATE_CURRENT;
+                  if (Build.VERSION.SDK_INT >= 23) fl |= PendingIntent.FLAG_IMMUTABLE;
+                  PendingIntent content = PendingIntent.getActivity(this, 0, open, fl);
+                  nb.setSmallIcon(playing ? android.R.drawable.ic_media_play : android.R.drawable.ic_media_pause)
+                      .setContentTitle(title)
+                      .setContentText(artist)
+                      .setContentIntent(content)
+                      .setVisibility(Notification.VISIBILITY_PUBLIC)
+                      .setOngoing(playing)
+                      .setShowWhen(false)
+                      .addAction(android.R.drawable.ic_media_previous, "Anterior", act("prev"))
+                      .addAction(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
+                          playing ? "Pausa" : "Reproducir", act(playing ? "pause" : "play"))
+                      .addAction(android.R.drawable.ic_media_next, "Siguiente", act("next"))
+                      .setStyle(new Notification.MediaStyle()
+                          .setMediaSession(session.getSessionToken())
+                          .setShowActionsInCompactView(0, 1, 2));
+                  Notification n = nb.build();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                  } else {
+                      startForeground(1, n);
+                  }
+                  if (!playing) stopForeground(false);
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (session != null) {
+                      session.setActive(false);
+                      session.release();
+                  }
+                  super.onDestroy();
+              }
+          }
+          EOF
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n</manifest>#' android/app/src/main/AndroidManifest.xml
+          sed -i 's#</application>#    <service android:name=".MediaService" android:exported="false" android:foregroundServiceType="mediaPlayback" android:stopWithTask="true" />\n    </application>#' android/app/src/main/AndroidManifest.xml
+          if [ -d ../android-res ]; then cp -r ../android-res/. android/app/src/main/res/; fi
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Publicar el APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp cap/android/app/build/outputs/apk/debug/app-debug.apk ReproductorPro.apk
+          gh release create "apk-${{ github.run_number }}" ReproductorPro.apk --title "Reproductor Pro APK ${{ github.run_number }}" --notes "Descarga ReproductorPro.apk e instalalo en tu Android."
