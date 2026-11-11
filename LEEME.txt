@@ -1,0 +1,6 @@
+REPRODUCTOR PRO v7 - SUBIDA EN UN SOLO PASO
+1. Descomprime este zip.
+2. Entra a la carpeta, selecciona TODO (Ctrl+A), incluidas las carpetas .github y android-res.
+3. GitHub > tu repositorio > Add file > Upload files > arrastra todo > Commit changes.
+4. Actions > "Build APK" corre solo (5-10 min). Luego Releases > ReproductorPro.apk
+5. Instala el nuevo APK encima del anterior (misma firma). La primera vez acepta el permiso de Notificaciones.
